@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  tikvadmin:
+    build:
+      context: .
+    image: tikvadmin:latest
+    container_name: tikvadmin
+    ports:
+      - "3002:3002"
+    restart: unless-stopped

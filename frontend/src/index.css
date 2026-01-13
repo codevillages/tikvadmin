@@ -1,0 +1,66 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 225 15% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 225 15% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 225 15% 12%;
+  --primary: 230 15% 12%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 25% 96%;
+  --secondary-foreground: 225 15% 12%;
+  --muted: 210 25% 96%;
+  --muted-foreground: 225 8% 46%;
+  --accent: 210 25% 96%;
+  --accent-foreground: 225 15% 12%;
+  --destructive: 0 70% 55%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 210 16% 88%;
+  --input: 210 16% 88%;
+  --ring: 230 15% 12%;
+  --radius: 20px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  color: hsl(var(--foreground));
+  background-color: hsl(var(--background));
+  -webkit-font-smoothing: antialiased;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.04);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.18);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.45);
+}
