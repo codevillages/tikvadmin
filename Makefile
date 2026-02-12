@@ -1,9 +1,7 @@
-buildimg:
-	docker save -o release/tikvadmin-frontend.tar tikvadmin-frontend:latest
-	docker save -o release/tikvadmin-backend.tar tikvadmin-backend:latest
 
 build:
 	docker buildx build -t tikvadmin:latest --platform linux/amd64  .
+	docker save -o tikvadmin.tar tikvadmin:latest
 
 buildlocal:
 	docker build -t tikvadmin:latest .

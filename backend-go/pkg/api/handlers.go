@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"tikv-backend/pkg/models"
 	"tikv-backend/pkg/tikv"
@@ -33,7 +36,6 @@ func (c *KVController) GetKV(ctx *gin.Context) {
 	}
 
 	requestCtx := context.Background()
-	var err error
 	var value string
 
 	if typeParam == "rawkv" {
@@ -143,8 +145,7 @@ func (c *KVController) ScanKVs(ctx *gin.Context) {
 
 	requestCtx := context.Background()
 	var pairs []models.KeyValuePair
-	var total int
-	var err error
+	hasMore := false
 
 	if query.Type == "rawkv" {
 		rawKvClient := tikv.GetRawKvClient()
@@ -165,9 +166,10 @@ func (c *KVController) ScanKVs(ctx *gin.Context) {
 			endKey = []byte(query.Prefix + "\xFF")
 		}
 
-		// 分页处理
+		// 分页处理：只扫描到当前页所需的数据量（+1 用于判断是否还有下一页）
 		offset := (query.Page - 1) * query.Limit
-		keys, values, err := rawKvClient.Scan(requestCtx, startKey, endKey, offset+query.Limit)
+		scanLimit := offset + query.Limit + 1
+		keys, values, err := rawKvClient.Scan(requestCtx, startKey, endKey, scanLimit)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, models.ApiResponse{
 				Success: false,
@@ -177,8 +179,22 @@ func (c *KVController) ScanKVs(ctx *gin.Context) {
 			return
 		}
 
+		// 判断是否存在下一页（不再计算总量）
+		hasMore = len(keys) > offset+query.Limit
+
+		// 仅取当前页范围内的数据
+		startIdx := offset
+		if startIdx > len(keys) {
+			startIdx = len(keys)
+		}
+		endIdx := offset + query.Limit
+		if endIdx > len(keys) {
+			endIdx = len(keys)
+		}
+
 		// 移除前缀并构建结果
-		for i, key := range keys {
+		for i := startIdx; i < endIdx; i++ {
+			key := keys[i]
 			// 移除 tikv_web_ 前缀
 			if len(key) > len(tikv.TiKVWebKeyPrefix) {
 				actualKey := string(key[len(tikv.TiKVWebKeyPrefix):])
@@ -187,14 +203,6 @@ func (c *KVController) ScanKVs(ctx *gin.Context) {
 					Value: string(values[i]),
 				})
 			}
-		}
-
-		// 获取总数（简化版本，实际应用中可能需要优化）
-		allKeys, _, err := rawKvClient.Scan(requestCtx, startKey, endKey, 10000) // 限制扫描数量
-		if err == nil {
-			total = len(allKeys)
-		} else {
-			total = len(keys)
 		}
 
 	} else {
@@ -220,7 +228,7 @@ func (c *KVController) ScanKVs(ctx *gin.Context) {
 
 		// 这里简化处理，Txn 模式下的扫描比较复杂
 		// 实际应用中可能需要使用 snapshot 或者其他方式
-		total = 0 // 暂时设为 0
+		hasMore = false
 		err = txnKvClient.Commit(requestCtx, txn)
 		if err != nil {
 			ctx.JSON(http.StatusInternalServerError, models.ApiResponse{
@@ -232,14 +240,11 @@ func (c *KVController) ScanKVs(ctx *gin.Context) {
 		}
 	}
 
-	totalPages := (total + query.Limit - 1) / query.Limit
-
 	result := models.PaginatedResult{
-		Data:       pairs,
-		Total:      total,
-		Page:       query.Page,
-		Limit:      query.Limit,
-		TotalPages: totalPages,
+		Data:    pairs,
+		Page:    query.Page,
+		Limit:   query.Limit,
+		HasMore: hasMore,
 	}
 
 	ctx.JSON(http.StatusOK, models.ApiResponse{
@@ -968,46 +973,23 @@ func (c *KVController) DeleteAllKVs(ctx *gin.Context) {
 			return
 		}
 
-		// 扫描所有键并删除
+		rawKvDAO := tikv.NewRawKv()
+
+		// 使用 DeleteRange 直接清空当前前缀下的所有键
 		startKey := []byte("")
 		endKey := []byte{0xFF, 0xFF, 0xFF, 0xFF}
-
-		// 分批扫描和删除，避免一次性处理太多数据
-		batchSize := 1000
-		for {
-			keys, _, err := rawKvClient.Scan(requestCtx, startKey, endKey, batchSize)
-			if err != nil {
-				ctx.JSON(http.StatusInternalServerError, models.ApiResponse{
-					Success: false,
-					Message: "Failed to scan keys for deletion",
-					Error:   err.Error(),
-				})
-				return
-			}
-
-			if len(keys) == 0 {
-				break // 没有更多键了
-			}
-
-			// 删除这批键
-			for _, key := range keys {
-				err := rawKvClient.Delete(requestCtx, key)
-				if err != nil {
-					ctx.JSON(http.StatusInternalServerError, models.ApiResponse{
-						Success: false,
-						Message: "Failed to delete key during batch deletion",
-						Error:   err.Error(),
-					})
-					return
-				}
-				deletedCount++
-			}
-
-			// 更新起始点为最后一个键，继续扫描
-			startKey = keys[len(keys)-1]
-			// 添加一个字节确保不会重复扫描到同一个键
-			startKey = append(startKey, 0x00)
+		err := rawKvDAO.DeleteRange(requestCtx, startKey, endKey, 0)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, models.ApiResponse{
+				Success: false,
+				Message: "Failed to delete range",
+				Error:   err.Error(),
+			})
+			return
 		}
+
+		// DeleteRange 无法返回准确数量
+		deletedCount = -1
 
 	} else if typeParam == "txn" {
 		txnKvClient := tikv.GetTxnKvClient()
@@ -1147,6 +1129,112 @@ func (c *KVController) DeleteAllKVs(ctx *gin.Context) {
 		Data: map[string]interface{}{
 			"deletedCount": deletedCount,
 			"type":         typeParam,
+		},
+	})
+}
+
+// FindSeaweedKeys 根据 seaweedkey 查找对象分片数据
+func (c *KVController) FindSeaweedKeys(ctx *gin.Context) {
+	var req models.SeaweedKeySearchRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, models.ApiResponse{
+			Success: false,
+			Message: "Invalid request body",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	seaweedKeySet := make(map[string]struct{})
+	for _, key := range req.SeaweedKeys {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		seaweedKeySet[trimmed] = struct{}{}
+	}
+	if len(seaweedKeySet) == 0 {
+		ctx.JSON(http.StatusBadRequest, models.ApiResponse{
+			Success: false,
+			Message: "Seaweed keys are required",
+		})
+		return
+	}
+
+	rawKvClient := tikv.GetRawKvClient()
+	if rawKvClient == nil {
+		ctx.JSON(http.StatusServiceUnavailable, models.ApiResponse{
+			Success: false,
+			Message: "TiKV RawKV client not initialized",
+		})
+		return
+	}
+
+	requestCtx := context.Background()
+	prefix := []byte("mainvp_")
+	realPrefix := append([]byte{}, tikv.TiKVWebKeyPrefix...)
+	realPrefix = append(realPrefix, prefix...)
+
+	startKey := append([]byte{}, realPrefix...)
+	endKey := append([]byte{}, realPrefix...)
+	endKey = append(endKey, 0xFF)
+
+	batchSize := 10000
+	totalScanned := 0
+	matches := make([]models.SeaweedKeyMatch, 0)
+	decodeErrors := make([]models.SeaweedKeyDecodeError, 0)
+
+	for {
+		keys, vals, err := rawKvClient.Scan(requestCtx, startKey, endKey, batchSize)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, models.ApiResponse{
+				Success: false,
+				Message: "Failed to scan keys for seaweed search",
+				Error:   err.Error(),
+			})
+			return
+		}
+
+		if len(keys) == 0 {
+			break
+		}
+
+		totalScanned += len(keys)
+
+		for i := 0; i < len(keys); i++ {
+			var part models.MainObjectVersionPart
+			if err := json.Unmarshal(vals[i], &part); err != nil {
+				trimmedKey := string(bytes.TrimPrefix(keys[i], tikv.TiKVWebKeyPrefix))
+				decodeErrors = append(decodeErrors, models.SeaweedKeyDecodeError{
+					Key:   trimmedKey,
+					Error: err.Error(),
+				})
+				continue
+			}
+
+			if _, ok := seaweedKeySet[part.SeaweedKey]; ok {
+				trimmedKey := string(bytes.TrimPrefix(keys[i], tikv.TiKVWebKeyPrefix))
+				matches = append(matches, models.SeaweedKeyMatch{
+					Key:  trimmedKey,
+					Part: part,
+				})
+			}
+		}
+
+		lastKey := append([]byte{}, keys[len(keys)-1]...)
+		startKey = append(lastKey, 0x00)
+		if !bytes.HasPrefix(startKey, realPrefix) {
+			break
+		}
+	}
+
+	ctx.JSON(http.StatusOK, models.ApiResponse{
+		Success: true,
+		Message: "SeaweedKey search completed",
+		Data: models.SeaweedKeySearchResponse{
+			Matches:      matches,
+			TotalScanned: totalScanned,
+			DecodeErrors: decodeErrors,
 		},
 	})
 }

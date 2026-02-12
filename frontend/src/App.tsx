@@ -33,14 +33,24 @@ const App: React.FC = () => {
     const stored = localStorage.getItem(pdEndpointsStorageKey);
     if (stored) {
       setClusterEndpointsInput(stored);
-      return;
+    } else {
+      setClusterEndpointsInput('');
     }
+  };
 
+  const applyClusterEndpoints = async (endpoints: string) => {
+    setSavingEndpoints(true);
     try {
-      const status = await TiKVApiService.getClusterStatus();
-      setClusterEndpointsInput(status.endpoints?.join(',') || '');
-    } catch (error) {
-      console.error('Failed to load cluster endpoints:', error);
+      await TiKVApiService.updateClusterEndpoints(endpoints);
+      toast.success('已更新并连接集群');
+      setClusterConnected(true);
+    } catch (error: any) {
+      console.error('Update cluster endpoints failed:', error);
+      const message = error.response?.data?.message || error.message || '更新集群地址失败';
+      toast.error(message);
+      setClusterConnected(false);
+    } finally {
+      setSavingEndpoints(false);
     }
   };
 
@@ -51,20 +61,9 @@ const App: React.FC = () => {
       return;
     }
 
-    setSavingEndpoints(true);
     localStorage.setItem(pdEndpointsStorageKey, nextEndpoints);
-    try {
-      const status = await TiKVApiService.updateClusterEndpoints(nextEndpoints);
-      const normalized = status.endpoints?.join(',') || nextEndpoints;
-      setClusterEndpointsInput(normalized);
-      localStorage.setItem(pdEndpointsStorageKey, normalized);
-      toast.success('集群地址已更新');
-      checkClusterHealth();
-    } catch (error: any) {
-      toast.error(error?.message || '更新集群地址失败');
-    } finally {
-      setSavingEndpoints(false);
-    }
+    setClusterEndpointsInput(nextEndpoints);
+    await applyClusterEndpoints(nextEndpoints);
   };
 
   React.useEffect(() => {

@@ -49,10 +49,13 @@ RUN apk --no-cache add \
 
 # ========== 配置 Nginx ==========
 # 创建 Nginx 必要目录（root 用户无需改权限）
-RUN mkdir -p /etc/nginx/conf.d /var/log/nginx /var/run/nginx
+RUN mkdir -p /etc/nginx/conf.d /var/log/nginx /var/run/nginx /tmp/nginx/client_body && \
+    chown -R nobody:nobody /tmp/nginx
 
 # 复制 Nginx 配置文件
 COPY nginx.conf /etc/nginx/nginx.conf
+# 复制 Basic Auth 账号文件（密文）
+COPY nginx.htpasswd /etc/nginx/.htpasswd
 
 # ========== 复制构建产物 ==========
 # 复制后端二进制文件

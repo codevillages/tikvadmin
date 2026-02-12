@@ -10,7 +10,7 @@ import {
   Trash2
 } from 'lucide-react';
 import TiKVApiService from '../services/api';
-import type { KeyValuePair, TiKVMode } from '../types';
+import type { KeyValuePair, SeaweedKeySearchResponse, TiKVMode } from '../types';
 import FormJSONEditor from './FormJSONEditor';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from './ui/alert-dialog';
 import { Badge } from './ui/badge';
@@ -30,9 +30,9 @@ interface KVTableProps {
 const KVTable: React.FC<KVTableProps> = ({ mode }) => {
   const [data, setData] = useState<KeyValuePair[]>([]);
   const [loading, setLoading] = useState(false);
-  const [total, setTotal] = useState(0);
   const [current, setCurrent] = useState(1);
   const [pageSize, setPageSize] = useState(100);
+  const [hasMore, setHasMore] = useState(false);
   const [prefix, setPrefix] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([]);
@@ -43,6 +43,10 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [deleteAllOpen, setDeleteAllOpen] = useState(false);
   const [deleteTargetKey, setDeleteTargetKey] = useState<string | null>(null);
+  const [seaweedSearchOpen, setSeaweedSearchOpen] = useState(false);
+  const [seaweedKeysInput, setSeaweedKeysInput] = useState('');
+  const [seaweedResults, setSeaweedResults] = useState<SeaweedKeySearchResponse | null>(null);
+  const [seaweedSearching, setSeaweedSearching] = useState(false);
 
   const [createKey, setCreateKey] = useState('');
   const [createValue, setCreateValue] = useState('');
@@ -66,21 +70,21 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
       // 确保数据结构正确
       if (result && typeof result === 'object') {
         setData(Array.isArray(result.data) ? result.data : []);
-        setTotal(typeof result.total === 'number' ? result.total : 0);
         setCurrent(typeof result.page === 'number' ? result.page : 1);
+        setHasMore(Boolean(result.hasMore));
       } else {
         // 如果返回的数据结构不正确，重置为空状态
         setData([]);
-        setTotal(0);
         setCurrent(1);
+        setHasMore(false);
       }
     } catch (error) {
       console.error('Failed to load data:', error);
       toast.error('加载数据失败');
       // 发生错误时重置状态
       setData([]);
-      setTotal(0);
       setCurrent(1);
+      setHasMore(false);
     } finally {
       setLoading(false);
     }
@@ -134,7 +138,18 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
 
   // 刷新数据
   const handleRefresh = () => {
-    loadData(current, pageSize, prefix);
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+
+    const trimmedPrefix = searchInput.trim();
+    const shouldResetPage = trimmedPrefix !== prefix;
+    const nextPage = shouldResetPage ? 1 : current;
+
+    setPrefix(trimmedPrefix);
+    setCurrent(nextPage);
+    loadData(nextPage, pageSize, trimmedPrefix);
   };
 
   // 分页处理
@@ -220,7 +235,11 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
   const performDeleteAll = async () => {
     try {
       const result = await TiKVApiService.deleteAllKVs(mode);
-      toast.success(`成功删除了 ${result.deletedCount} 条 ${mode.toUpperCase()} 记录`);
+      if (result.deletedCount < 0) {
+        toast.success(`成功删除全部 ${mode.toUpperCase()} 记录（数量未知）`);
+      } else {
+        toast.success(`成功删除了 ${result.deletedCount} 条 ${mode.toUpperCase()} 记录`);
+      }
       setSelectedRowKeys([]);
       setDeleteAllConfirm('');
       setDeleteAllOpen(false);
@@ -244,6 +263,31 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
     setEditValue(formattedValue);
     setEditOpen(true);
   };
+
+  const handleSeaweedSearch = async () => {
+    const keys = seaweedKeysInput
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+
+    if (keys.length === 0) {
+      toast.warning('请输入 seaweedkey');
+      return;
+    }
+
+    setSeaweedSearching(true);
+    try {
+      const result = await TiKVApiService.findSeaweedKeys(keys);
+      setSeaweedResults(result);
+      toast.success(`查询完成，命中 ${result.matches.length} 条`);
+      setSeaweedSearchOpen(false);
+    } catch (error: any) {
+      console.error('Failed to find seaweed keys:', error);
+      toast.error(error.message || '查找 seaweedkey 失败');
+    } finally {
+      setSeaweedSearching(false);
+    }
+  };
   const allVisibleSelected =
     data.length > 0 && data.every((item) => selectedRowKeys.includes(item.key));
 
@@ -259,9 +303,8 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
     }
   };
 
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const startIndex = (current - 1) * pageSize + 1;
-  const endIndex = Math.min(current * pageSize, total);
+  const endIndex = data.length > 0 ? startIndex + data.length - 1 : 0;
 
   return (
     <div className="space-y-5">
@@ -273,23 +316,25 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
                 {mode.toUpperCase()} 数据面板
               </div>
               <Badge variant="secondary">
-                总量 {total}
+                总量未知
               </Badge>
             </div>
             <div className="flex w-full flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-              <div className="relative w-full lg:flex-1">
-                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  placeholder="请输入前缀关键词进行搜索..."
-                  value={searchInput}
-                  onChange={(e) => handleRealTimeSearch(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      handleSearch(searchInput);
+              <div className="flex w-full flex-col gap-2 lg:flex-1 lg:flex-row lg:items-center">
+                <div className="relative w-full lg:flex-1">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    placeholder="请输入前缀关键词进行搜索..."
+                    value={searchInput}
+                    onChange={(e) => handleRealTimeSearch(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        handleSearch(searchInput);
                     }
                   }}
                   className="pl-9 border border-slate-200 bg-slate-100/80 focus-visible:border-slate-300 focus-visible:ring-slate-200"
                 />
+                </div>
               </div>
               <div className="flex flex-wrap items-center gap-2 lg:justify-end">
                 <Button size="sm" variant="outline" onClick={handleRefresh} disabled={loading}>
@@ -309,6 +354,14 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
                   <Trash2 className="h-4 w-4" />
                   删除所有
                 </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setSeaweedSearchOpen(true)}
+                  disabled={mode !== 'rawkv'}
+                >
+                  查找 seaweedkey
+                </Button>
               </div>
             </div>
             {selectedRowKeys.length > 0 && (
@@ -326,11 +379,24 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
         </div>
       </Card>
 
-      <div className="grid gap-3 md:grid-cols-3">
+      {seaweedResults && (
         <Card className="p-4">
-          <div className="text-sm text-muted-foreground">{mode.toUpperCase()} 键总数</div>
-          <div className="mt-1 text-xl font-semibold">{total}</div>
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold">SeaweedKey 查询结果</div>
+            <Button size="sm" variant="outline" onClick={() => setSeaweedResults(null)}>
+              清空结果
+            </Button>
+          </div>
+          <Textarea
+            value={JSON.stringify(seaweedResults, null, 2)}
+            readOnly
+            rows={12}
+            className="mt-3 font-mono text-xs"
+          />
         </Card>
+      )}
+
+      <div className="grid gap-3 md:grid-cols-2">
         <Card className="p-4">
           <div className="text-sm text-muted-foreground">当前页数量</div>
           <div className="mt-1 text-xl font-semibold">{data.length}</div>
@@ -412,7 +478,7 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
 
         <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 text-sm">
           <div className="text-muted-foreground">
-            {total === 0 ? '共 0 条' : `第 ${startIndex}-${endIndex} 条，共 ${total} 条`}
+            {data.length === 0 ? '暂无数据' : `第 ${startIndex}-${endIndex} 条（总量未知）`}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button
@@ -424,13 +490,13 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
               上一页
             </Button>
             <span className="text-muted-foreground">
-              第 {current} / {totalPages} 页
+              第 {current} 页
             </span>
             <Button
               size="sm"
               variant="outline"
-              onClick={() => handlePageChange(Math.min(totalPages, current + 1))}
-              disabled={current >= totalPages}
+              onClick={() => handlePageChange(current + 1)}
+              disabled={!hasMore}
             >
               下一页
             </Button>
@@ -569,6 +635,33 @@ const KVTable: React.FC<KVTableProps> = ({ mode }) => {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog open={seaweedSearchOpen} onOpenChange={setSeaweedSearchOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>查找 seaweedkey</DialogTitle>
+            <DialogDescription>每行一个 seaweedkey，支持多行输入。</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3">
+            <Label htmlFor="seaweed-keys">seaweedkey 列表</Label>
+            <Textarea
+              id="seaweed-keys"
+              value={seaweedKeysInput}
+              onChange={(e) => setSeaweedKeysInput(e.target.value)}
+              placeholder="4be0a2701fcc465b828efaa2fa84e486&#10;43cac3b6682f4eee90049c6d1ae97290"
+              rows={8}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSeaweedSearchOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={handleSeaweedSearch} disabled={seaweedSearching}>
+              {seaweedSearching ? '查询中...' : '提交查询'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={deleteAllOpen} onOpenChange={setDeleteAllOpen}>
         <DialogContent>

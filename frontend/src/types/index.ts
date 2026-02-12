@@ -29,10 +29,9 @@ export interface QueryOptions {
 
 export interface PaginatedResult<T> {
   data: T[];
-  total: number;
   page: number;
   limit: number;
-  totalPages: number;
+  hasMore: boolean;
 }
 
 export interface ApiResponse<T = any> {
@@ -94,3 +93,40 @@ export interface ClusterStatusResponse {
 }
 
 export type TiKVMode = 'rawkv' | 'txn';
+
+export interface MainObjectVersionPart {
+  bucket_version_status: number;
+  bucket: string;
+  src_key: string;
+  unique_id: string;
+  seaweed_bucket: string;
+  seaweed_key: string;
+  md5?: string;
+  etag?: string;
+  size: number;
+  part_id: number;
+  content_type?: string;
+  upload_type: string;
+  upload_id: string;
+  version_id?: string;
+  cluster_id: number;
+  storage_class: string;
+  soft_delete: number;
+  status: number;
+  create_time: number;
+  last_modified: number;
+}
+
+export interface SeaweedKeyMatch {
+  key: string;
+  part: MainObjectVersionPart;
+}
+
+export interface SeaweedKeySearchResponse {
+  matches: SeaweedKeyMatch[];
+  totalScanned: number;
+  decodeErrors?: Array<{
+    key: string;
+    error: string;
+  }>;
+}

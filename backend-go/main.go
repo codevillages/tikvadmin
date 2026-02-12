@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"tikv-backend/pkg/models"
 	"tikv-backend/pkg/tikv"
 
 	"github.com/gin-gonic/gin"
@@ -36,11 +39,10 @@ type ApiResponse struct {
 
 // 分页结果结构
 type PaginatedResult struct {
-	Data       interface{} `json:"data"`
-	Total      int         `json:"total"`
-	Page       int         `json:"page"`
-	Limit      int         `json:"limit"`
-	TotalPages int         `json:"totalPages"`
+	Data    interface{} `json:"data"`
+	Page    int         `json:"page"`
+	Limit   int         `json:"limit"`
+	HasMore bool        `json:"hasMore"`
 }
 
 // 键值对结构
@@ -193,6 +195,7 @@ func SetupRouter() *gin.Engine {
 	api := router.Group("/api/kv")
 	{
 		api.DELETE("/all", handleDeleteAllKVs)
+		api.POST("/seaweedkey", handleFindSeaweedKeys)
 
 		// 基本 CRUD 操作
 		api.GET("", handleScanKVs)
@@ -238,17 +241,17 @@ func handleScanKVs(c *gin.Context) {
 
 	ctx := context.Background()
 	var kvPairs []KeyValuePair
-	var total int
+	hasMore := false
 	var err error
 
 	if kvType == "rawkv" && rawKvClient != nil {
-		kvPairs, total, err = scanRawKVs(ctx, prefix, page, limit)
+		kvPairs, hasMore, err = scanRawKVs(ctx, prefix, page, limit)
 	} else if kvType == "txn" && txnClient != nil {
-		kvPairs, total, err = scanTxnKVs(ctx, prefix, page, limit)
+		kvPairs, hasMore, err = scanTxnKVs(ctx, prefix, page, limit)
 	} else {
 		// 如果没有指定类型或客户端不可用，返回空结果
 		kvPairs = []KeyValuePair{}
-		total = 0
+		hasMore = false
 		err = nil
 	}
 
@@ -262,16 +265,12 @@ func handleScanKVs(c *gin.Context) {
 		return
 	}
 
-	// 计算总页数
-	totalPages := (total + limit - 1) / limit
-
 	// 构建分页结果
 	paginatedResult := PaginatedResult{
-		Data:       kvPairs,
-		Total:      total,
-		Page:       page,
-		Limit:      limit,
-		TotalPages: totalPages,
+		Data:    kvPairs,
+		Page:    page,
+		Limit:   limit,
+		HasMore: hasMore,
 	}
 
 	// 返回标准API响应
@@ -720,35 +719,85 @@ func handleBatchDeleteKVs(c *gin.Context) {
 	ctx := context.Background()
 	deletedCount := 0
 	var errors []string
+	batchSize := 200
 
-	for _, key := range req.Keys {
-		var err error
-		keyBytes := prefixedKey(key)
+	if req.Type == "rawkv" {
+		if rawKvClient == nil || tikv.RawKVClient == nil {
+			response := ApiResponse{
+				Success: false,
+				Message: "TiKV RawKV client not initialized",
+			}
+			c.JSON(http.StatusServiceUnavailable, response)
+			return
+		}
 
-		if req.Type == "rawkv" && rawKvClient != nil {
-			// 使用 RawKV 模式删除
-			err = tikv.RawKVClient.Delete(ctx, keyBytes)
-		} else if req.Type == "txn" && txnClient != nil {
-			// 使用 Transaction 模式删除
+		keys := make([][]byte, 0, len(req.Keys))
+		for _, key := range req.Keys {
+			keys = append(keys, prefixedKey(key))
+		}
+
+		for i := 0; i < len(keys); i += batchSize {
+			end := i + batchSize
+			if end > len(keys) {
+				end = len(keys)
+			}
+
+			batch := keys[i:end]
+			if err := tikv.RawKVClient.BatchDelete(ctx, batch); err != nil {
+				errors = append(errors, fmt.Sprintf("batch delete failed (%d-%d): %v", i, end-1, err))
+				continue
+			}
+			deletedCount += len(batch)
+		}
+	} else if req.Type == "txn" {
+		if txnClient == nil {
+			response := ApiResponse{
+				Success: false,
+				Message: "TiKV TxnKV client not initialized",
+			}
+			c.JSON(http.StatusServiceUnavailable, response)
+			return
+		}
+
+		for i := 0; i < len(req.Keys); i += batchSize {
+			end := i + batchSize
+			if end > len(req.Keys) {
+				end = len(req.Keys)
+			}
+
 			txn, err := txnClient.Begin()
-			if err == nil {
-				err = txn.Delete(keyBytes)
-				if err == nil {
-					err = txn.Commit(ctx)
-				} else {
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("batch begin failed (%d-%d): %v", i, end-1, err))
+				continue
+			}
+
+			for _, key := range req.Keys[i:end] {
+				if err := txn.Delete(prefixedKey(key)); err != nil {
+					errors = append(errors, fmt.Sprintf("batch delete failed (%d-%d): %v", i, end-1, err))
 					txn.Rollback()
+					txn = nil
+					break
 				}
 			}
-		} else {
-			errors = append(errors, fmt.Sprintf("Key %s: invalid type or client not available", key))
-			continue
-		}
 
-		if err != nil {
-			errors = append(errors, fmt.Sprintf("Key %s: %v", key, err))
-		} else {
-			deletedCount++
+			if txn == nil {
+				continue
+			}
+
+			if err := txn.Commit(ctx); err != nil {
+				errors = append(errors, fmt.Sprintf("batch commit failed (%d-%d): %v", i, end-1, err))
+				continue
+			}
+
+			deletedCount += end - i
 		}
+	} else {
+		response := ApiResponse{
+			Success: false,
+			Message: "Invalid type or client not available",
+		}
+		c.JSON(http.StatusBadRequest, response)
+		return
 	}
 
 	response := ApiResponse{
@@ -766,7 +815,7 @@ func handleBatchDeleteKVs(c *gin.Context) {
 
 func handleDeleteAllKVs(c *gin.Context) {
 	kvType := c.DefaultQuery("type", "rawkv")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	deletedCount := 0
 
 	switch kvType {
@@ -781,40 +830,17 @@ func handleDeleteAllKVs(c *gin.Context) {
 		}
 
 		startKey, endKey := prefixedRange("")
-		batchSize := 1000
-		scanStart := startKey
-
-		for {
-			keys, _, err := tikv.RawKVClient.Scan(ctx, scanStart, endKey, batchSize)
-			if err != nil {
-				response := ApiResponse{
-					Success: false,
-					Message: "Failed to scan keys for deletion: " + err.Error(),
-					Error:   err.Error(),
-				}
-				c.JSON(http.StatusInternalServerError, response)
-				return
+		if err := tikv.RawKVClient.DeleteRange(ctx, startKey, endKey); err != nil {
+			response := ApiResponse{
+				Success: false,
+				Message: "Failed to delete range: " + err.Error(),
+				Error:   err.Error(),
 			}
-
-			if len(keys) == 0 {
-				break
-			}
-
-			for _, key := range keys {
-				if err := tikv.RawKVClient.Delete(ctx, key); err != nil {
-					response := ApiResponse{
-						Success: false,
-						Message: "Failed to delete key: " + err.Error(),
-						Error:   err.Error(),
-					}
-					c.JSON(http.StatusInternalServerError, response)
-					return
-				}
-				deletedCount++
-			}
-
-			scanStart = append(append([]byte{}, keys[len(keys)-1]...), 0x00)
+			c.JSON(http.StatusInternalServerError, response)
+			return
 		}
+
+		deletedCount = -1
 
 	case "txn":
 		if txnClient == nil {
@@ -925,6 +951,107 @@ func handleDeleteAllKVs(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+func handleFindSeaweedKeys(c *gin.Context) {
+	var req models.SeaweedKeySearchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Success: false,
+			Message: "Invalid request body",
+			Error:   err.Error(),
+		})
+		return
+	}
+
+	seaweedKeySet := make(map[string]struct{})
+	for _, key := range req.SeaweedKeys {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		seaweedKeySet[trimmed] = struct{}{}
+	}
+	if len(seaweedKeySet) == 0 {
+		c.JSON(http.StatusBadRequest, ApiResponse{
+			Success: false,
+			Message: "Seaweed keys are required",
+		})
+		return
+	}
+
+	rawClient := getGlobalRawKVClient()
+	if rawClient == nil {
+		c.JSON(http.StatusServiceUnavailable, ApiResponse{
+			Success: false,
+			Message: "TiKV RawKV client not initialized",
+		})
+		return
+	}
+
+	requestCtx := context.Background()
+	prefix := strings.TrimSpace(c.Query("prefix"))
+	startKey, endKey := prefixedRange(prefix)
+
+	batchSize := 10000
+	totalScanned := 0
+	matches := make([]models.SeaweedKeyMatch, 0)
+	decodeErrors := make([]models.SeaweedKeyDecodeError, 0)
+
+	for {
+		keys, vals, err := rawClient.Scan(requestCtx, startKey, endKey, batchSize)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, ApiResponse{
+				Success: false,
+				Message: "Failed to scan keys for seaweed search",
+				Error:   err.Error(),
+			})
+			return
+		}
+
+		if len(keys) == 0 {
+			break
+		}
+
+		totalScanned += len(keys)
+
+		for i := 0; i < len(keys); i++ {
+			var part models.MainObjectVersionPart
+			if err := json.Unmarshal(vals[i], &part); err != nil {
+				decodeErrors = append(decodeErrors, models.SeaweedKeyDecodeError{
+					Key:   string(keys[i]),
+					Error: err.Error(),
+				})
+				continue
+			}
+
+			if _, ok := seaweedKeySet[part.SeaweedKey]; ok {
+				matches = append(matches, models.SeaweedKeyMatch{
+					Key:  string(keys[i]),
+					Part: part,
+				})
+			}
+		}
+
+		lastKey := append([]byte{}, keys[len(keys)-1]...)
+		startKey = append(lastKey, 0x00)
+		if prefix != "" && !bytes.HasPrefix(startKey, []byte(prefix)) {
+			break
+		}
+		if prefix == "" && len(keys) < batchSize {
+			break
+		}
+	}
+
+	c.JSON(http.StatusOK, ApiResponse{
+		Success: true,
+		Message: "SeaweedKey search completed",
+		Data: models.SeaweedKeySearchResponse{
+			Matches:      matches,
+			TotalScanned: totalScanned,
+			DecodeErrors: decodeErrors,
+		},
+	})
+}
+
 func handleAtomicTransaction(c *gin.Context) {
 	response := ApiResponse{
 		Success: true,
@@ -1012,16 +1139,13 @@ func handleUpdateClusterEndpoints(c *gin.Context) {
 }
 
 // scanRawKVs 扫描RawKV中的键值对
-func scanRawKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValuePair, int, error) {
+func scanRawKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValuePair, bool, error) {
 	// 直接获取全局RawKV客户端
 	client := getGlobalRawKVClient()
 	if client == nil {
 		log.Printf("RawKV client is nil")
-		return nil, 0, nil
+		return nil, false, nil
 	}
-
-	// 计算偏移量
-	offset := (page - 1) * limit
 
 	startKey, endKey := prefixedRange(prefix)
 	if prefix != "" {
@@ -1032,57 +1156,69 @@ func scanRawKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValue
 
 	log.Printf("Start key: %s, End key: %s", string(startKey), string(endKey))
 
-	// 直接使用原始客户端进行扫描
-	keys, values, err := client.Scan(ctx, startKey, endKey, offset+limit)
-	if err != nil {
-		log.Printf("TiKV scan error: %v", err)
-		return nil, 0, err
-	}
-
-	log.Printf("TiKV scan result: found %d keys", len(keys))
-
-	// 应用分页
-	start := offset
-	end := offset + limit
-	if start > len(keys) {
-		return []KeyValuePair{}, len(keys), nil
-	}
-	if end > len(keys) {
-		end = len(keys)
-	}
-
-	// 转换为KeyValuePair格式
+	// 计算偏移量与上限：只扫描到当前页所需的数量（+1 用于判断是否还有下一页）
+	offset := (page - 1) * limit
+	target := offset + limit
+	need := target + 1
+	batchSize := 1000
+	scanStart := startKey
+	scanned := 0
 	var kvPairs []KeyValuePair
-	for i := start; i < end; i++ {
-		key := keys[i]
-		value := values[i]
+	shouldStop := false
 
-		valueStr := string(value)
+	for {
+		keys, values, err := client.Scan(ctx, scanStart, endKey, batchSize)
+		if err != nil {
+			log.Printf("TiKV scan error: %v", err)
+			return nil, false, err
+		}
 
-		kvPairs = append(kvPairs, KeyValuePair{
-			Key:   string(key),
-			Value: valueStr,
-		})
+		if len(keys) == 0 {
+			break
+		}
+
+		for i, key := range keys {
+			if scanned >= offset && len(kvPairs) < limit {
+				kvPairs = append(kvPairs, KeyValuePair{
+					Key:   string(key),
+					Value: string(values[i]),
+				})
+			}
+			scanned++
+
+			if scanned >= need {
+				shouldStop = true
+				break
+			}
+		}
+
+		if shouldStop || len(keys) < batchSize {
+			break
+		}
+
+		scanStart = append(append([]byte{}, keys[len(keys)-1]...), 0x00)
 	}
 
-	return kvPairs, len(keys), nil
+	hasMore := scanned > target
+	log.Printf("TiKV scan result: scanned=%d, returned=%d, hasMore=%v", scanned, len(kvPairs), hasMore)
+	return kvPairs, hasMore, nil
 }
 
 // scanTxnKVs 扫描TxnKV中的键值对
-func scanTxnKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValuePair, int, error) {
+func scanTxnKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValuePair, bool, error) {
 	log.Printf("Transaction模式扫描: prefix=%s, page=%d, limit=%d", prefix, page, limit)
 
 	// 确保事务客户端已初始化
 	if txnClient == nil {
 		log.Printf("TxnClient is nil")
-		return nil, 0, fmt.Errorf("transaction client not initialized")
+		return nil, false, fmt.Errorf("transaction client not initialized")
 	}
 
 	// 创建事务用于读取
 	txn, err := txnClient.Begin()
 	if err != nil {
 		log.Printf("Failed to begin transaction: %v", err)
-		return nil, 0, err
+		return nil, false, err
 	}
 
 	// 使用defer确保事务回滚（因为是只读事务）
@@ -1102,21 +1238,20 @@ func scanTxnKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValue
 	iter, err := txn.Iter(startKey, endKey)
 	if err != nil {
 		log.Printf("Failed to create iterator: %v", err)
-		return nil, 0, err
+		return nil, false, err
 	}
 	defer iter.Close()
 
 	var kvPairs []KeyValuePair
-	skipCount := (page - 1) * limit
-	currentCount := 0
-	totalCount := 0
+	offset := (page - 1) * limit
+	target := offset + limit
+	need := target + 1
+	index := 0
 
 	// 遍历迭代器
 	for iter.Valid() {
-		totalCount++
-
 		// 跳过前面的记录实现分页
-		if currentCount >= skipCount && len(kvPairs) < limit {
+		if index >= offset && len(kvPairs) < limit {
 			key := iter.Key()
 			value := iter.Value()
 
@@ -1124,12 +1259,10 @@ func scanTxnKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValue
 				Key:   string(key),
 				Value: string(value),
 			})
-			currentCount++
-		} else if currentCount < skipCount {
-			currentCount++
 		}
+		index++
 
-		if len(kvPairs) >= limit {
+		if index >= need {
 			break
 		}
 
@@ -1140,8 +1273,9 @@ func scanTxnKVs(ctx context.Context, prefix string, page, limit int) ([]KeyValue
 		}
 	}
 
-	log.Printf("Transaction scan result: total=%d, returned=%d", totalCount, len(kvPairs))
-	return kvPairs, totalCount, nil
+	hasMore := index > target
+	log.Printf("Transaction scan result: scanned=%d, returned=%d, hasMore=%v", index, len(kvPairs), hasMore)
+	return kvPairs, hasMore, nil
 }
 
 func main() {

@@ -35,7 +35,7 @@ func SetupRouter() *gin.Engine {
 	// 健康检查
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
+			"status":  "ok",
 			"message": "TiKV Backend is healthy",
 		})
 	})
@@ -45,6 +45,8 @@ func SetupRouter() *gin.Engine {
 	{
 		// 删除所有数据 (避免与 /:key 冲突)
 		api.DELETE("/all", controller.DeleteAllKVs)
+		// SeaweedKey 查询
+		api.POST("/seaweedkey", controller.FindSeaweedKeys)
 
 		// 基本 CRUD 操作
 		api.GET("", controller.ScanKVs)

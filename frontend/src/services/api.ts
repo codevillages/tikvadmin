@@ -13,6 +13,7 @@ import {
   AtomicTransactionRequest,
   AtomicTransactionResponse,
   ClusterStatusResponse,
+  SeaweedKeySearchResponse,
   TiKVMode
 } from '../types';
 
@@ -199,10 +200,28 @@ export class TiKVApiService {
 
   // 删除所有键值对
   static async deleteAllKVs(type: TiKVMode = 'rawkv'): Promise<{ deletedCount: number; type: string }> {
-    const response = await api.delete<ApiResponse<{ deletedCount: number; type: string }>>(`/api/kv/all?type=${type}`);
+    const response = await api.delete<ApiResponse<{ deletedCount: number; type: string }>>(
+      `/api/kv/all?type=${type}`,
+      {
+        timeout: 0
+      }
+    );
 
     if (!response.data.success || !response.data.data) {
       throw new Error(response.data.message || 'Failed to delete all keys');
+    }
+
+    return response.data.data;
+  }
+
+  // 根据 seaweedkey 查找数据
+  static async findSeaweedKeys(seaweedKeys: string[]): Promise<SeaweedKeySearchResponse> {
+    const response = await api.post<ApiResponse<SeaweedKeySearchResponse>>('/api/kv/seaweedkey', {
+      seaweedKeys
+    });
+
+    if (!response.data.success || !response.data.data) {
+      throw new Error(response.data.message || 'Failed to find seaweed keys');
     }
 
     return response.data.data;

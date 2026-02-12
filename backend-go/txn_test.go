@@ -10,12 +10,6 @@ import (
 	"tikv-backend/pkg/tikv"
 )
 
-// KeyValuePair 键值对结构（与main.go中定义保持一致）
-type KeyValuePair struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
 // TestData 测试数据结构
 type TestData struct {
 	OrderID   string  `json:"order_id"`
